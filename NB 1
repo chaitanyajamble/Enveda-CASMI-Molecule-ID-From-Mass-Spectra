@@ -1,0 +1,313 @@
+import os
+import glob
+import json
+import numpy as np
+import pandas as pd
+ 
+DATA_DIR = "/----/input/competitions/enveda-CASMI26-molecule-id-mass-spectra"
+TRAIN_PATH = os.path.join(DATA_DIR, "train.parquet")
+TEST_PATH = os.path.join(DATA_DIR, "test.parquet")
+SAMPLE_SUB_PATH = os.path.join(DATA_DIR, "sample_submission.csv")
+WORK_DIR = "/----/working"
+os.makedirs(WORK_DIR, exist_ok=True)
+ 
+# ============================================================
+# 0. Environment 
+# ============================================================
+ 
+def _preview_parquet(path, n=3):
+    print(f"\n--- {path} ---")
+    df = pd.read_parquet(path)
+    print(f"shape: {df.shape}")
+    print("dtypes:")
+    print(df.dtypes)
+    print("\nhead:")
+    with pd.option_context("display.max_colwidth", 80):
+        print(df.head(n))
+    return df
+ 
+ 
+def discover():
+    print("== Files under DATA_DIR ==")
+    for p in sorted(glob.glob(os.path.join(DATA_DIR, "**", "*"), recursive=True)):
+        if os.path.isfile(p):
+            print(f"{os.path.getsize(p):>12,d}  {p}")
+ 
+    for p in (TRAIN_PATH, TEST_PATH):
+        if os.path.exists(p):
+            _preview_parquet(p)
+        else:
+            print(f"\n(missing: {p})")
+ 
+    if os.path.exists(SAMPLE_SUB_PATH):
+        print(f"\n--- {SAMPLE_SUB_PATH} ---")
+        sub = pd.read_csv(SAMPLE_SUB_PATH)
+        print(sub.columns.tolist())
+        print(sub.head(5))
+        print(f"n rows: {len(sub)}")
+ 
+ 
+# ============================================================
+# 1. LOAD
+# ============================================================
+ 
+TRAIN_COLS = ["normalized_smiles", "inchikey14", "precursor_mz", "adduct",
+              "ms2_mzs", "ms2_normalized_intensities"]
+TEST_COLS = ["molecule_id", "spectrum_id", "precursor_mz", "adduct",
+             "ms2_mzs", "ms2_normalized_intensities"]
+ 
+ 
+def load_train(path: str) -> pd.DataFrame:
+    df = pd.read_parquet(path, columns=TRAIN_COLS)
+    order = np.argsort(df["precursor_mz"].to_numpy())
+    df = df.iloc[order].reset_index(drop=True)
+    return df
+ 
+ 
+def load_test(path: str) -> pd.DataFrame:
+    df = pd.read_parquet(path, columns=TEST_COLS)
+    return df
+ 
+ 
+# ============================================================
+# 2. SPECTRAL SIMILARITY 
+# ============================================================
+ 
+def modified_cosine(q_mz, q_i, q_pmz, c_mz, c_i, c_pmz, tol_da: float = 0.01) -> float:
+    shift = q_pmz - c_pmz
+ 
+    def matched_score(delta):
+        b_mz = c_mz + delta
+        pairs = []
+        for ia, mza in enumerate(q_mz):
+            diffs = np.abs(b_mz - mza)
+            ib = int(np.argmin(diffs))
+            if diffs[ib] <= tol_da:
+                pairs.append((ia, ib, q_i[ia] * c_i[ib]))
+        if not pairs:
+            return 0.0
+        pairs.sort(key=lambda t: -t[2])
+        used_a, used_b, score = set(), set(), 0.0
+        for ia, ib, w in pairs:
+            if ia in used_a or ib in used_b:
+                continue
+            used_a.add(ia)
+            used_b.add(ib)
+            score += w
+        norm = np.sqrt((q_i ** 2).sum() * (c_i ** 2).sum())
+        return float(score / norm) if norm > 0 else 0.0
+ 
+    direct = matched_score(0.0)
+    shifted = matched_score(shift) if abs(shift) > tol_da else 0.0
+    return max(direct, shifted)
+ 
+ 
+# ============================================================
+# 3.RETRIEVAL 
+# ============================================================
+ 
+PRECURSOR_TOL_PPM = 15.0
+PRECURSOR_TOL_DA_FLOOR = 0.003
+WIDE_FALLBACK_DA = 0.5
+MAX_CANDIDATES_PER_QUERY = 4000
+ 
+ 
+def _window_indices(sorted_mz: np.ndarray, center: float, tol_da: float) -> np.ndarray:
+    lo = np.searchsorted(sorted_mz, center - tol_da, side="left")
+    hi = np.searchsorted(sorted_mz, center + tol_da, side="right")
+    return lo, hi
+ 
+ 
+def get_candidates(q_mz, q_i, q_pmz, q_adduct, train_df: pd.DataFrame,
+                    sorted_mz: np.ndarray) -> dict:
+    tol_da = max(q_pmz * PRECURSOR_TOL_PPM / 1e6, PRECURSOR_TOL_DA_FLOOR)
+    lo, hi = _window_indices(sorted_mz, q_pmz, tol_da)
+ 
+    if hi <= lo:  # nothing within tight ppm window — widen once
+        lo, hi = _window_indices(sorted_mz, q_pmz, WIDE_FALLBACK_DA)
+ 
+    if hi <= lo:
+        return {}
+ 
+    idx = np.arange(lo, hi)
+ 
+    
+    if q_adduct is not None and len(idx) > 50:
+        adducts = train_df["adduct"].to_numpy()[idx]
+        same = idx[adducts == q_adduct]
+        if len(same) >= 5:
+            idx = same
+ 
+    if len(idx) > MAX_CANDIDATES_PER_QUERY:
+        
+        dists = np.abs(sorted_mz[idx] - q_pmz)
+        keep = np.argsort(dists)[:MAX_CANDIDATES_PER_QUERY]
+        idx = idx[keep]
+ 
+    sub = train_df.iloc[idx]
+    smiles_arr = sub["normalized_smiles"].to_numpy()
+    key_arr = sub["inchikey14"].to_numpy()
+    pmz_arr = sub["precursor_mz"].to_numpy()
+    mz_col = sub["ms2_mzs"].to_numpy()
+    inten_col = sub["ms2_normalized_intensities"].to_numpy()
+ 
+    best = {}
+    for j in range(len(idx)):
+        c_mz = np.asarray(mz_col[j], dtype=float)
+        c_i = np.asarray(inten_col[j], dtype=float)
+        if c_i.size == 0:
+            continue
+        if c_i.max() > 0:
+            c_i = c_i / c_i.max()
+        score = modified_cosine(q_mz, q_i, q_pmz, c_mz, c_i, pmz_arr[j])
+        key = key_arr[j]
+        if key not in best or score > best[key][0]:
+            best[key] = (score, smiles_arr[j])
+ 
+    return best
+ 
+ 
+# ============================================================
+# 4. MOLECULE-LEVEL RANKING.
+# ============================================================
+ 
+def _prep_query(mz_val, i_val):
+    mz = np.asarray(mz_val, dtype=float)
+    inten = np.asarray(i_val, dtype=float)
+    if inten.size and inten.max() > 0:
+        inten = inten / inten.max()
+    return mz, inten
+ 
+ 
+def rank_molecule(spectra_rows: list, train_df: pd.DataFrame, sorted_mz: np.ndarray,
+                   top_k: int = 25) -> list:
+    combined = {}
+    for row in spectra_rows:
+        q_mz, q_i = _prep_query(row["ms2_mzs"], row["ms2_normalized_intensities"])
+        if q_mz.size == 0:
+            continue
+        cands = get_candidates(q_mz, q_i, row["precursor_mz"], row.get("adduct"),
+                                train_df, sorted_mz)
+        for key, (score, smi) in cands.items():
+            if key not in combined or score > combined[key][0]:
+                combined[key] = (score, smi)
+ 
+    ranked = sorted(combined.items(), key=lambda kv: -kv[1][0])
+    return [smi for _key, (_score, smi) in ranked[:top_k]]
+ 
+ 
+# ============================================================
+# 5. VALIDATION — MRR@25   
+# ============================================================
+ 
+def run_validation(train_df: pd.DataFrame, holdout_molecules: int = 150, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    unique_keys = train_df["inchikey14"].unique()
+    if len(unique_keys) <= holdout_molecules * 2:
+        holdout_molecules = max(1, len(unique_keys) // 5)
+    hold_keys = set(rng.choice(unique_keys, size=holdout_molecules, replace=False))
+ 
+    is_holdout = train_df["inchikey14"].isin(hold_keys).to_numpy()
+    holdout_df = train_df[is_holdout].reset_index(drop=True)
+    library_df = train_df[~is_holdout].reset_index(drop=True)
+    library_sorted_mz = library_df["precursor_mz"].to_numpy()  # already globally sorted by load_train, but library_df is a filtered subset so re-sort
+    order = np.argsort(library_sorted_mz)
+    library_df = library_df.iloc[order].reset_index(drop=True)
+    library_sorted_mz = library_df["precursor_mz"].to_numpy()
+ 
+   
+    scores = []
+    for key, group in holdout_df.groupby("inchikey14"):
+        rows = group.to_dict("records")
+        preds = rank_molecule(rows, library_df, library_sorted_mz)
+        scores.append((key, preds))
+ 
+   
+    smi_to_key = dict(zip(train_df["normalized_smiles"], train_df["inchikey14"]))
+ 
+    rrs = []
+    for truth_key, preds in scores:
+        rr = 0.0
+        for rank, smi in enumerate(preds, start=1):
+            if smi_to_key.get(smi) == truth_key:
+                rr = 1.0 / rank
+                break
+        rrs.append(rr)
+ 
+    score = float(np.mean(rrs)) if rrs else 0.0
+    print(f"Local validation MRR@25 (library search baseline, "
+          f"{len(rrs)} held-out molecules): {score:.4f}")
+    return score
+ 
+ 
+# ============================================================
+# 6. PIPELINE 
+# ============================================================
+ 
+def make_submission(train_path: str, test_path: str, out_path: str,
+                     sample_sub_path: str = None):
+    print("Loading train (library)...")
+    train_df = load_train(train_path)
+    sorted_mz = train_df["precursor_mz"].to_numpy()
+    print(f"Loaded {len(train_df):,} library spectra "
+          f"({train_df['inchikey14'].nunique():,} unique structures)")
+ 
+    print("Loading test...")
+    test_df = load_test(test_path)
+    print(f"Loaded {len(test_df):,} test spectra across "
+          f"{test_df['molecule_id'].nunique():,} molecules")
+ 
+    print("\nRunning local validation on held-out train molecules...")
+    run_validation(train_df)
+ 
+    print("\nRanking test molecules...")
+    rows = []
+    for molecule_id, group in test_df.groupby("molecule_id"):
+        spectra_rows = group.to_dict("records")
+        preds = rank_molecule(spectra_rows, train_df, sorted_mz)
+        rows.append({"molecule_id": molecule_id, "smiles": ";".join(preds)})
+ 
+    sub = pd.DataFrame(rows, columns=["molecule_id", "smiles"])
+ 
+    # --- validity checks matching the competition's rejection rules ---
+    assert sub["molecule_id"].is_unique, "duplicate molecule_id in submission"
+    assert sub["molecule_id"].notna().all(), "null molecule_id"
+    assert sub["smiles"].notna().all(), "null smiles field"
+    assert (sub["smiles"].str.split(";").apply(len) <= 25).all(), "over 25 guesses somewhere"
+ 
+    if sample_sub_path and os.path.exists(sample_sub_path):
+        sample = pd.read_csv(sample_sub_path)
+        id_col = "molecule_id" if "molecule_id" in sample.columns else sample.columns[0]
+        expected_ids = set(sample[id_col])
+        got_ids = set(sub["molecule_id"])
+        missing, extra = expected_ids - got_ids, got_ids - expected_ids
+        if missing:
+            print(f"WARNING: {len(missing)} molecule_ids missing, e.g. {list(missing)[:5]}")
+        if extra:
+            print(f"WARNING: {len(extra)} unexpected molecule_ids, e.g. {list(extra)[:5]}")
+        if not missing and not extra:
+            print("molecule_id set matches sample_submission.csv exactly. Good.")
+        sub = sub.set_index("molecule_id").loc[sample[id_col]].reset_index()
+ 
+    empty_preds = (sub["smiles"] == "").sum()
+    if empty_preds:
+        print(f"NOTE: {empty_preds} molecules got zero candidates within the "
+              f"precursor window — consider widening WIDE_FALLBACK_DA.")
+ 
+    sub.to_csv(out_path, index=False)
+    print(f"\nWrote {out_path}  ({len(sub)} rows)")
+    return sub
+ 
+ 
+# ============================================================
+# 7. ENTRY POINT
+# ============================================================
+ 
+if __name__ == "__main__":
+    OUT_PATH = os.path.join(WORK_DIR, "submission.csv")
+    if os.path.exists(TRAIN_PATH) and os.path.exists(TEST_PATH):
+        make_submission(TRAIN_PATH, TEST_PATH, OUT_PATH, sample_sub_path=SAMPLE_SUB_PATH)
+    else:
+        print(f"\n{TRAIN_PATH} / {TEST_PATH} don't exist here — "
+              "run this inside the ---- notebook for the competition.")
+
