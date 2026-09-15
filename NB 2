@@ -360,7 +360,7 @@ def get_candidates(q_mz, q_i, q_pmz, q_adduct, lib_index: dict) -> dict:
  
  
 def rank_molecule(spectra_rows: list, lib_index: dict, top_k: int = TOP_K) -> list:
-    combined = {}  
+    combined = {}  ---key -> [best_score, best_matched, support_count]
     for row in spectra_rows:
         q_mz, q_i = preprocess_spectrum(row["ms2_mzs"], row["ms2_normalized_intensities"])
         if q_mz.size == 0:
